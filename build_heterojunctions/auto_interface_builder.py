@@ -143,8 +143,7 @@ def apply_inplane_strain(slab, scale_x, scale_y):
 def align_and_stack_ordered(slab_bottom, slab_top, separation=3.2, vacuum=20.0):
     """
     Align and stack two slabs with proper lattice matching.
-    Ensures in-plane lattice vectors match exactly and are properly oriented.
-    Uses the original slab lattices without modification to preserve structure integrity.
+    Uses the original slab lattices directly without modification to preserve structure integrity.
     """
     # Copy slabs to avoid modifying originals
     bottom = slab_bottom.copy()
@@ -409,19 +408,21 @@ def build_interface_from_builder(structA, structB, miller_a, miller_b, slab_thic
     
     interface = best_interface
     
-    # Extract bottom and top slabs from interface
-    # The interface structure contains both slabs
+    # The interface structure from CoherentInterfaceBuilder.get_interfaces is already complete
+    # It contains both slabs properly aligned
     combined = interface
     
-    # Separate into bottom (substrate) and top (film) slabs
+    # Extract bottom and top slabs from interface for separate POSCAR files
     # Find the interface plane (approximate)
     z_coords = combined.cart_coords[:, 2]
-    interface_z = np.mean(z_coords)
+    # Use median or density gap method for better interface identification
+    interface_z = np.median(z_coords)
     
     bottom_sites = [i for i, site in enumerate(combined) if site.coords[2] < interface_z]
     top_sites = [i for i, site in enumerate(combined) if site.coords[2] >= interface_z]
     
-    # Create separate structures
+    # Create separate structures using the same lattice as combined
+    # This preserves the structure integrity
     bottom = Structure(combined.lattice, 
                       [combined[i].species_string for i in bottom_sites],
                       [combined[i].frac_coords for i in bottom_sites],
