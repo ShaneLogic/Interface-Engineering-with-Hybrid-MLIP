@@ -63,20 +63,21 @@ def identify_interface_z(structure, method='density_gap'):
 
 def find_interface_layers(structure, interface_z, n_layers_per_side=1, layer_thickness=2.0):
     """
-    Find atomic layers closest to the interface.
+    Find atomic layers closest to the interface on both sides.
+    Selects n_layers_per_side distinct atomic layers from each side (TiO2 and perovskite).
     
     Args:
         structure: pymatgen Structure object
         interface_z: z-coordinate of the interface
         n_layers_per_side: Number of layers to relax on each side (default: 1)
-        layer_thickness: Thickness threshold for defining a layer (Angstroms)
+        layer_thickness: Thickness threshold for grouping atoms into layers (Angstroms)
     
     Returns:
         list: List of site indices to relax (at interface layers)
     """
     z_coords = structure.cart_coords[:, 2]
     
-    # Separate atoms into bottom (substrate) and top (film)
+    # Separate atoms into bottom (substrate, e.g., TiO2) and top (film, e.g., perovskite)
     bottom_indices = [i for i, z in enumerate(z_coords) if z < interface_z]
     top_indices = [i for i, z in enumerate(z_coords) if z >= interface_z]
     
@@ -87,27 +88,45 @@ def find_interface_layers(structure, interface_z, n_layers_per_side=1, layer_thi
     bottom_z = [z_coords[i] for i in bottom_indices]
     top_z = [z_coords[i] for i in top_indices]
     
-    # Find the closest layers to interface from each side
-    # Bottom side: find atoms with highest z (closest to interface)
-    max_bottom_z = max(bottom_z)
-    bottom_layer_z_threshold = max_bottom_z - layer_thickness
+    # Round z-coordinates to identify distinct atomic layers
+    # Use reasonable precision (0.01 Å) to group atoms that are essentially at the same z-level
+    z_precision = 0.01  # 0.01 Å precision for layer identification
     
-    # Top side: find atoms with lowest z (closest to interface)
-    min_top_z = min(top_z)
-    top_layer_z_threshold = min_top_z + layer_thickness
+    bottom_z_rounded = [round(z, 2) for z in bottom_z]  # Round to 0.01 Å
+    top_z_rounded = [round(z, 2) for z in top_z]
     
-    # Collect atoms in interface layers (these will be relaxed)
+    # Get unique z-levels for each side (these represent distinct atomic layers)
+    bottom_unique_z = sorted(set(bottom_z_rounded), reverse=True)  # Highest z first (closest to interface)
+    top_unique_z = sorted(set(top_z_rounded))  # Lowest z first (closest to interface)
+    
+    # Select n_layers_per_side unique z-levels closest to interface
+    # Each z-level represents a distinct atomic layer
+    selected_bottom_z_levels = bottom_unique_z[:n_layers_per_side] if len(bottom_unique_z) >= n_layers_per_side else bottom_unique_z
+    selected_top_z_levels = top_unique_z[:n_layers_per_side] if len(top_unique_z) >= n_layers_per_side else top_unique_z
+    
+    # Collect atoms in selected layers (these will be relaxed)
+    # Use z_precision (0.01 Å) to match atoms to exact z-levels, not layer_thickness
+    # layer_thickness is only used for documentation/clustering purposes, not for selection
     relaxed_indices = []
     
-    # Bottom layer closest to interface
-    for i in bottom_indices:
-        if z_coords[i] >= bottom_layer_z_threshold:
-            relaxed_indices.append(i)
+    # Bottom side (TiO2): select atoms in the closest n_layers_per_side layers
+    for selected_z in selected_bottom_z_levels:
+        for i in bottom_indices:
+            z = z_coords[i]
+            # Check if atom's z (rounded) matches the selected z-level exactly
+            if abs(round(z, 2) - selected_z) < z_precision:
+                relaxed_indices.append(i)
     
-    # Top layer closest to interface
-    for i in top_indices:
-        if z_coords[i] <= top_layer_z_threshold:
-            relaxed_indices.append(i)
+    # Top side (perovskite): select atoms in the closest n_layers_per_side layers
+    for selected_z in selected_top_z_levels:
+        for i in top_indices:
+            z = z_coords[i]
+            # Check if atom's z (rounded) matches the selected z-level exactly
+            if abs(round(z, 2) - selected_z) < z_precision:
+                relaxed_indices.append(i)
+    
+    # Remove duplicates
+    relaxed_indices = list(set(relaxed_indices))
     
     return relaxed_indices
 
