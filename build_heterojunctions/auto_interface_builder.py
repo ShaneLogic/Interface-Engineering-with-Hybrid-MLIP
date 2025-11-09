@@ -130,6 +130,23 @@ def _generate_zsl_parameter_grid(
     param_grid.sort(key=lambda p: (p["max_area"], p["max_length_tol"], 0 if p["bidirectional"] else 1))
     return param_grid
 
+
+def _reorder_structure_for_poscar(struct: Structure) -> Structure:
+    """
+    Group sites by species so that POSCAR headers list each element once in the
+    order they first appear. Within each species block, maintain ascending
+    fractional z for readability.
+    """
+    struct_copy = struct.copy()
+    species_order: List[str] = []
+    for site in struct_copy:
+        symbol = site.species_string
+        if symbol not in species_order:
+            species_order.append(symbol)
+    order_index = {symbol: idx for idx, symbol in enumerate(species_order)}
+    struct_copy.sort(key=lambda site: (order_index[site.species_string], site.frac_coords[2]))
+    return struct_copy
+
 def load_structure(path):
     s = Structure.from_file(path)
     return s
@@ -404,9 +421,12 @@ def align_and_stack_ordered(slab_bottom, slab_top, separation=3.2, vacuum=20.0):
     return bottom_separated, top_separated, combined
 
 def write_poscars(bottom, top, combined, prefix="interface"):
-    Poscar(bottom).write_file(f"{prefix}_bottom_strained.vasp")
-    Poscar(top).write_file(f"{prefix}_top_strained.vasp")
-    Poscar(combined).write_file(f"{prefix}_combined.vasp")
+    bottom_for_io = _reorder_structure_for_poscar(bottom)
+    top_for_io = _reorder_structure_for_poscar(top)
+    combined_for_io = _reorder_structure_for_poscar(combined)
+    Poscar(bottom_for_io, sort_structure=False).write_file(f"{prefix}_bottom_strained.vasp")
+    Poscar(top_for_io, sort_structure=False).write_file(f"{prefix}_top_strained.vasp")
+    Poscar(combined_for_io, sort_structure=False).write_file(f"{prefix}_combined.vasp")
     print("Wrote POSCARs:", f"{prefix}_bottom_strained.vasp", f"{prefix}_top_strained.vasp", f"{prefix}_combined.vasp")
 
 def estimate_atoms_for_match(structA, structB, miller_a, miller_b, supercell_a, supercell_b, 
