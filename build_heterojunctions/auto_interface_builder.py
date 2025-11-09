@@ -144,6 +144,7 @@ def align_and_stack_ordered(slab_bottom, slab_top, separation=3.2, vacuum=20.0):
     """
     Align and stack two slabs with proper lattice matching.
     Uses the original slab lattices directly without modification to preserve structure integrity.
+    Returns bottom, top, and combined structures, where bottom and top are properly separated.
     """
     # Copy slabs to avoid modifying originals
     bottom = slab_bottom.copy()
@@ -203,27 +204,55 @@ def align_and_stack_ordered(slab_bottom, slab_top, separation=3.2, vacuum=20.0):
     combined_lat_matrix = np.vstack([a_vec, b_vec, c_vec])
     combined_lattice = Lattice(combined_lat_matrix)
     
-    # Create combined structure
+    # Create structures with the combined lattice for bottom and top
+    # This ensures they use the same lattice as the combined structure
+    # Convert bottom slab to use combined lattice
+    bottom_cart_coords = bottom.cart_coords
+    bottom_frac_coords = [combined_lattice.get_fractional_coords(coord) for coord in bottom_cart_coords]
+    # Wrap fractional coordinates to [0, 1)
+    bottom_frac_coords = [(fc % 1.0) for fc in bottom_frac_coords]
+    bottom_separated = Structure(combined_lattice,
+                                bottom.species,
+                                bottom_frac_coords,
+                                coords_are_cartesian=False)
+    
+    # Convert top slab to use combined lattice
+    top_cart_coords = top.cart_coords
+    top_frac_coords = [combined_lattice.get_fractional_coords(coord) for coord in top_cart_coords]
+    # Wrap fractional coordinates to [0, 1)
+    top_frac_coords = [(fc % 1.0) for fc in top_frac_coords]
+    top_separated = Structure(combined_lattice,
+                            top.species,
+                            top_frac_coords,
+                            coords_are_cartesian=False)
+    
+    # Create combined structure by adding all sites
     combined = Structure(combined_lattice, [], [])
     
-    # Add bottom slab sites - use cartesian coordinates then convert to fractional
-    for site in bottom:
-        frac_coords = combined_lattice.get_fractional_coords(site.coords)
-        # Wrap fractional coordinates to [0, 1)
-        frac_coords = frac_coords % 1.0
-        combined.append(site.species_string, frac_coords, coords_are_cartesian=False)
+    # Add bottom slab sites first
+    for site in bottom_separated:
+        combined.append(site.species_string, site.frac_coords, coords_are_cartesian=False)
     
-    # Add top slab sites - use cartesian coordinates then convert to fractional
-    for site in top:
-        frac_coords = combined_lattice.get_fractional_coords(site.coords)
-        # Wrap fractional coordinates to [0, 1)
-        frac_coords = frac_coords % 1.0
-        combined.append(site.species_string, frac_coords, coords_are_cartesian=False)
+    # Add top slab sites
+    for site in top_separated:
+        combined.append(site.species_string, site.frac_coords, coords_are_cartesian=False)
     
-    # Sort sites by z-coordinate for better ordering
+    # Sort combined by z-coordinate for better ordering
     combined.sort(key=lambda site: site.frac_coords[2])
     
-    return bottom, top, combined
+    # Verify separation: ensure bottom and top are properly separated
+    bottom_z_coords = bottom_separated.cart_coords[:, 2]
+    top_z_coords = top_separated.cart_coords[:, 2]
+    if len(bottom_z_coords) > 0 and len(top_z_coords) > 0:
+        bottom_z_max = bottom_z_coords.max()
+        top_z_min = top_z_coords.min()
+        gap_size = top_z_min - bottom_z_max
+        if gap_size < 0:
+            print(f"Warning: Overlap detected! bottom_z_max={bottom_z_max:.2f} Å, top_z_min={top_z_min:.2f} Å")
+        elif gap_size < 0.5:
+            print(f"Warning: Very small gap: {gap_size:.2f} Å")
+    
+    return bottom_separated, top_separated, combined
 
 def write_poscars(bottom, top, combined, prefix="interface"):
     Poscar(bottom).write_file(f"{prefix}_bottom_strained.vasp")
@@ -413,13 +442,75 @@ def build_interface_from_builder(structA, structB, miller_a, miller_b, slab_thic
     combined = interface
     
     # Extract bottom and top slabs from interface for separate POSCAR files
-    # Find the interface plane (approximate)
+    # Use a robust method to find the interface plane based on z-coordinate gaps
     z_coords = combined.cart_coords[:, 2]
-    # Use median or density gap method for better interface identification
-    interface_z = np.median(z_coords)
+    z_min, z_max = z_coords.min(), z_coords.max()
+    z_range = z_max - z_min
     
-    bottom_sites = [i for i, site in enumerate(combined) if site.coords[2] < interface_z]
-    top_sites = [i for i, site in enumerate(combined) if site.coords[2] >= interface_z]
+    # Method 1: Find the largest gap in z-coordinates (most reliable for interfaces)
+    sorted_z = np.sort(z_coords)
+    z_diffs = np.diff(sorted_z)
+    
+    if len(z_diffs) > 0:
+        max_gap_idx = np.argmax(z_diffs)
+        max_gap_size = z_diffs[max_gap_idx]
+        interface_z = (sorted_z[max_gap_idx] + sorted_z[max_gap_idx + 1]) / 2.0
+        
+        # Only use gap method if gap is significant (at least 0.5 Å or 5% of range)
+        min_gap_threshold = max(0.5, z_range * 0.05)
+        if max_gap_size < min_gap_threshold:
+            # Gap too small, use density-based method
+            n_bins = min(100, max(10, len(z_coords) // 10))
+            if n_bins > 0:
+                hist, bin_edges = np.histogram(z_coords, bins=n_bins)
+                # Find bin with minimum density (likely the gap)
+                min_density_idx = np.argmin(hist)
+                if min_density_idx < len(bin_edges) - 1:
+                    gap_z = (bin_edges[min_density_idx] + bin_edges[min_density_idx + 1]) / 2.0
+                    # Use gap_z if it's reasonable (not too close to edges)
+                    if gap_z > z_min + z_range * 0.1 and gap_z < z_max - z_range * 0.1:
+                        interface_z = gap_z
+                        print(f"Using density-based interface detection: z={interface_z:.2f} Å")
+    else:
+        # Fallback: use median
+        interface_z = np.median(z_coords)
+        print(f"Warning: Using median for interface detection: z={interface_z:.2f} Å")
+    
+    # Separate sites based on interface_z
+    # Use a tolerance to ensure clean separation, but make it adaptive
+    tolerance = max(0.05, min(0.5, z_range * 0.01))  # Between 0.05 and 0.5 Å
+    
+    bottom_sites = []
+    top_sites = []
+    
+    # First pass: separate based on z coordinate
+    for i, site in enumerate(combined):
+        z_coord = site.coords[2]
+        if z_coord < interface_z - tolerance:
+            bottom_sites.append(i)
+        elif z_coord > interface_z + tolerance:
+            top_sites.append(i)
+        else:
+            # In the tolerance region: assign to the closer side
+            if z_coord < interface_z:
+                bottom_sites.append(i)
+            else:
+                top_sites.append(i)
+    
+    # Verify separation: check that we have atoms in both parts
+    if len(bottom_sites) == 0 or len(top_sites) == 0:
+        print("Warning: Initial separation failed, trying alternative method")
+        # Try using the actual gap position more strictly
+        if len(z_diffs) > 0:
+            # Use the exact gap position
+            interface_z = sorted_z[max_gap_idx]
+            bottom_sites = [i for i, z in enumerate(z_coords) if z <= interface_z]
+            top_sites = [i for i, z in enumerate(z_coords) if z > interface_z]
+        else:
+            # Last resort: use median
+            interface_z = np.median(z_coords)
+            bottom_sites = [i for i, site in enumerate(combined) if site.coords[2] < interface_z]
+            top_sites = [i for i, site in enumerate(combined) if site.coords[2] >= interface_z]
     
     # Create separate structures using the same lattice as combined
     # This preserves the structure integrity
@@ -432,6 +523,17 @@ def build_interface_from_builder(structA, structB, miller_a, miller_b, slab_thic
                    [combined[i].species_string for i in top_sites],
                    [combined[i].frac_coords for i in top_sites],
                    coords_are_cartesian=False)
+    
+    # Verify separation quality
+    if len(bottom_sites) > 0 and len(top_sites) > 0:
+        bottom_z_max = z_coords[bottom_sites].max()
+        top_z_min = z_coords[top_sites].min()
+        gap_size = top_z_min - bottom_z_max
+        print(f"Separation verification: bottom z_max={bottom_z_max:.2f} Å, top z_min={top_z_min:.2f} Å, gap={gap_size:.2f} Å")
+        if gap_size < 0:
+            print("Warning: Overlap detected between bottom and top structures!")
+        elif gap_size < 0.5:
+            print("Warning: Very small gap between bottom and top structures!")
     
     return bottom, top, combined
 
