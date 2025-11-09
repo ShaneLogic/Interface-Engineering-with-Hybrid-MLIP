@@ -16,13 +16,119 @@ Requirements: pymatgen, numpy
 
 import argparse
 import math
+from typing import Dict, Iterable, List, Set, Tuple
+
 import numpy as np
-from pymatgen.core import Structure, Lattice
+from pymatgen.core import Lattice, Structure
 from pymatgen.core.surface import SlabGenerator
 from pymatgen.transformations.standard_transformations import SupercellTransformation
-#from pymatgen.analysis.interfaces import InterfaceMatcher
-from pymatgen.analysis.interfaces.coherent_interfaces import CoherentInterfaceBuilder
+# from pymatgen.analysis.interfaces import InterfaceMatcher
+from pymatgen.analysis.interfaces.coherent_interfaces import CoherentInterfaceBuilder, Interface
 from pymatgen.io.vasp import Poscar
+
+
+def _extend_matrix_2d_to_3d(mat_2d: np.ndarray) -> np.ndarray:
+    """
+    Promote a 2x2 transformation matrix to a 3x3 supercell matrix by keeping the
+    original in-plane mapping and leaving the out-of-plane direction unchanged.
+    """
+    mat_3d = np.eye(3)
+    mat_3d[0:2, 0:2] = np.array(mat_2d)
+    return np.rint(mat_3d).astype(int)
+
+
+def _matrix_key(film_trans: np.ndarray, sub_trans: np.ndarray) -> Tuple[int, ...]:
+    """Create a hashable key describing a pair of 2x2 transformation matrices."""
+    film_int = tuple(np.rint(film_trans).astype(int).flatten().tolist())
+    sub_int = tuple(np.rint(sub_trans).astype(int).flatten().tolist())
+    return film_int + sub_int
+
+
+def _angle_between(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
+    """Return the angle between two vectors in degrees."""
+    dot_val = np.dot(vec_a, vec_b)
+    norms = np.linalg.norm(vec_a) * np.linalg.norm(vec_b)
+    if norms < 1e-8:
+        return 0.0
+    cos_theta = np.clip(dot_val / norms, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos_theta)))
+
+
+def _compute_match_metrics(match_obj) -> Dict[str, np.ndarray | float]:
+    """Extract length/angle mismatch information from a ZSLMatch."""
+    film_vectors = np.array(match_obj.film_vectors)
+    sub_vectors = np.array(match_obj.substrate_vectors)
+
+    film_lengths = np.linalg.norm(film_vectors, axis=1)
+    sub_lengths = np.linalg.norm(sub_vectors, axis=1)
+    avg_lengths = (film_lengths + sub_lengths) / 2.0
+    # Relative mismatch per in-plane vector (signed)
+    length_components = np.divide(
+        (film_lengths - sub_lengths),
+        np.where(avg_lengths < 1e-8, 1.0, avg_lengths),
+    )
+
+    film_angle = _angle_between(film_vectors[0], film_vectors[1])
+    sub_angle = _angle_between(sub_vectors[0], sub_vectors[1])
+    angle_mismatch = abs(film_angle - sub_angle)
+
+    return {
+        "film_lengths": film_lengths,
+        "substrate_lengths": sub_lengths,
+        "length_components": length_components,
+        "max_length_mismatch": float(np.max(np.abs(length_components))),
+        "film_angle": film_angle,
+        "substrate_angle": sub_angle,
+        "angle_mismatch": angle_mismatch,
+    }
+
+
+def _generate_zsl_parameter_grid(
+    base_tol: float,
+    max_area: float,
+    allow_bidirectional: bool = True,
+) -> List[Dict[str, float | bool]]:
+    """
+    Generate a prioritized list of parameter dictionaries for ZSLGenerator searches.
+    Parameters with smaller area, tighter tolerances, and bidirectional matching are
+    considered first to encourage compact supercells.
+    """
+    base_tol = max(0.01, min(base_tol, 0.15))
+    length_candidates = {
+        base_tol,
+        min(0.15, base_tol * 1.35),
+        min(0.15, base_tol * 1.7),
+        min(0.15, base_tol + 0.02),
+        min(0.15, 0.12 if base_tol < 0.12 else base_tol),
+    }
+    length_values = sorted(length_candidates)
+
+    area_candidates = {
+        max_area,
+        max_area * 1.3,
+        max_area * 1.7,
+        max_area * 2.2,
+    }
+    area_values = sorted({float(max(10.0, a)) for a in area_candidates})
+
+    bidi_options: Iterable[bool] = [True, False] if allow_bidirectional else [False]
+
+    param_grid: List[Dict[str, float | bool]] = []
+    for length_tol in length_values:
+        angle_tol = min(0.1, max(0.015, length_tol / 3.0))
+        for area in area_values:
+            for bidi in bidi_options:
+                param_grid.append(
+                    {
+                        "max_area": float(area),
+                        "max_length_tol": float(length_tol),
+                        "max_angle_tol": float(angle_tol),
+                        "bidirectional": bool(bidi),
+                    }
+                )
+
+    param_grid.sort(key=lambda p: (p["max_area"], p["max_length_tol"], 0 if p["bidirectional"] else 1))
+    return param_grid
 
 def load_structure(path):
     s = Structure.from_file(path)
@@ -47,76 +153,93 @@ def build_slab(struct, miller, min_slab_size, vacuum, center_slab=True):
         raise RuntimeError(f"No slabs generated for miller {miller}")
     return slabs[0]
 
-def search_matches(structA, structB, miller_a, miller_b, tol=0.03, max_area=500, max_match=20):
+def search_matches(
+    structA,
+    structB,
+    miller_a,
+    miller_b,
+    tol: float = 0.03,
+    max_area: float = 500,
+    max_match: int = 20,
+    allow_bidirectional: bool = True,
+):
     """
     Use CoherentInterfaceBuilder to find candidate in-plane supercells that match.
     Requires bulk structures and Miller indices, not slabs.
     Returns a list of match dicts with strains and transforms.
     """
-    # CoherentInterfaceBuilder needs bulk structures and Miller indices
-    # structA is film, structB is substrate (can be swapped if needed)
     from pymatgen.analysis.interfaces.zsl import ZSLGenerator
-    
-    # Create ZSLGenerator - try with max_area parameter, fallback to default
-    try:
-        zslgen = ZSLGenerator(max_area=max_area)
-    except TypeError:
-        # If max_area is not a valid parameter, use default ZSLGenerator
-        zslgen = ZSLGenerator()
-    
-    # CoherentInterfaceBuilder signature: (substrate_structure, film_structure, 
-    #                                       film_miller, substrate_miller, zslgen)
-    matcher = CoherentInterfaceBuilder(
-        substrate_structure=structB,  # B is substrate
-        film_structure=structA,       # A is film
-        film_miller=miller_a,
-        substrate_miller=miller_b,
-        zslgen=zslgen
-    )
-    
-    # Get matches from zsl_matches attribute (not get_matches method)
-    zsl_matches = matcher.zsl_matches
-    if not zsl_matches or len(zsl_matches) == 0:
-        return []
-    
-    # Convert ZSLMatch objects to summary dicts
-    summary = []
-    for m in zsl_matches[:max_match]:
-        # Filter by area only (ZSLMatch already represents valid matches)
-        if m.match_area > max_area:
+
+    param_grid = _generate_zsl_parameter_grid(tol, max_area, allow_bidirectional=allow_bidirectional)
+    matches: List[dict] = []
+    seen_keys: Set[Tuple[int, ...]] = set()
+
+    for params in param_grid:
+        try:
+            zslgen = ZSLGenerator(
+                max_area=params["max_area"],
+                max_length_tol=params["max_length_tol"],
+                max_angle_tol=params["max_angle_tol"],
+                bidirectional=params["bidirectional"],
+            )
+        except TypeError:
+            # Legacy pymatgen versions may not support all keyword arguments.
+            zslgen = ZSLGenerator(max_area=params["max_area"])
+
+        matcher = CoherentInterfaceBuilder(
+            substrate_structure=structB,
+            film_structure=structA,
+            film_miller=miller_a,
+            substrate_miller=miller_b,
+            zslgen=zslgen,
+        )
+
+        zsl_matches = matcher.zsl_matches or []
+        if len(zsl_matches) == 0:
             continue
-        
-        # Get transformation matrices (2x2 for in-plane)
-        film_trans = np.array(m.film_transformation)
-        substrate_trans = np.array(m.substrate_transformation) if hasattr(m, 'substrate_transformation') else np.eye(2)
-        
-        # Calculate approximate strain vectors from transformation matrices
-        # These represent the relative deformation needed for matching
-        strain_A = np.array([film_trans[0,0] - 1.0, film_trans[1,1] - 1.0, film_trans[0,1]])
-        strain_B = np.array([substrate_trans[0,0] - 1.0, substrate_trans[1,1] - 1.0, substrate_trans[0,1]])
-        
-        # Convert 2x2 transformation matrices to 3x3 supercell matrices
-        # Extend 2x2 to 3x3 by adding identity for z-direction
-        def extend_matrix_2d_to_3d(mat_2d):
-            mat_3d = np.eye(3)
-            mat_3d[0:2, 0:2] = mat_2d
-            # Round to nearest integer for supercell matrix
-            return np.round(mat_3d).astype(int)
-        
-        supercell_a = extend_matrix_2d_to_3d(film_trans)
-        supercell_b = extend_matrix_2d_to_3d(substrate_trans)
-        
-        summary.append({
-            "strain_A": strain_A,
-            "strain_B": strain_B,
-            "area": m.match_area,
-            "supercell_a": supercell_a,
-            "supercell_b": supercell_b,
-            "tilt": 0.0,  # ZSLMatch doesn't have tilt info directly
-            "match_obj": m
-        })
-    
-    return summary
+
+        for idx, match_obj in enumerate(zsl_matches[: max_match or None]):
+            film_trans = np.array(match_obj.film_transformation)
+            sub_trans = (
+                np.array(match_obj.substrate_transformation)
+                if hasattr(match_obj, "substrate_transformation")
+                else np.eye(2)
+            )
+            key = _matrix_key(film_trans, sub_trans)
+            if key in seen_keys:
+                continue
+
+            metrics = _compute_match_metrics(match_obj)
+            summary = {
+                "area": float(match_obj.match_area),
+                "film_transformation": film_trans,
+                "substrate_transformation": sub_trans,
+                "supercell_a": _extend_matrix_2d_to_3d(film_trans),
+                "supercell_b": _extend_matrix_2d_to_3d(sub_trans),
+                "det_a": float(abs(np.linalg.det(film_trans))),
+                "det_b": float(abs(np.linalg.det(sub_trans))),
+                "length_components": metrics["length_components"],
+                "length_mismatch": metrics["max_length_mismatch"],
+                "angle_mismatch": metrics["angle_mismatch"],
+                "angles": (metrics["film_angle"], metrics["substrate_angle"]),
+                "film_lengths": metrics["film_lengths"],
+                "substrate_lengths": metrics["substrate_lengths"],
+                "zsl_params": params,
+                "priority": (
+                    params["max_area"],
+                    params["max_length_tol"],
+                    0 if params["bidirectional"] else 1,
+                    idx,
+                ),
+                "match_index": idx,
+            }
+            matches.append(summary)
+            seen_keys.add(key)
+
+    matches.sort(key=lambda m: m["priority"])
+    if max_match:
+        matches = matches[:max_match]
+    return matches
 
 def compute_inplane_norms(latt):
     """Return norms of the first two lattice vectors (in-plane)."""
@@ -150,30 +273,60 @@ def align_and_stack_ordered(slab_bottom, slab_top, separation=3.2, vacuum=20.0):
     bottom = slab_bottom.copy()
     top = slab_top.copy()
     
-    # Align bottom slab: ensure min z = 0
-    bottom_cart = bottom.cart_coords
-    minz_b = bottom_cart[:,2].min()
-    bottom.translate_sites(list(range(len(bottom))), [0,0, -minz_b])
-    
-    # Compute bottom thickness (max z)
-    bottom_cart = bottom.cart_coords
-    maxz_b = bottom_cart[:,2].max()
-    
-    # Align top slab: translate so minz_t sits at maxz_b + separation
-    top_cart = top.cart_coords
-    minz_t = top_cart[:,2].min()
-    dz = maxz_b + separation - minz_t
-    top.translate_sites(list(range(len(top))), [0,0, dz])
-    
-    # Determine combined cell z dimension
-    maxz_top = top.cart_coords[:,2].max()
-    total_z = maxz_top + vacuum
-    
     # Use bottom's lattice as the reference (it should match top after straining)
-    # Get in-plane vectors from bottom
+    # Get in-plane vectors from bottom to determine the interface normal.
     bottom_lat = bottom.lattice.matrix
     a_vec = bottom_lat[0]
     b_vec = bottom_lat[1]
+
+    # Calculate surface normal from in-plane vectors
+    ab_normal = np.cross(a_vec, b_vec)
+    ab_normal_norm = np.linalg.norm(ab_normal)
+    if ab_normal_norm < 1e-10:
+        raise ValueError("In-plane vectors are parallel or degenerate")
+    ab_normal_unit = ab_normal / ab_normal_norm
+    # Ensure the surface normal points in the same general direction as the original c vector.
+    if np.dot(ab_normal_unit, bottom_lat[2]) < 0:
+        ab_normal_unit *= -1.0
+
+    # Align bottom slab along the interface normal so the minimum projection is 0.
+    if len(bottom) > 0:
+        bottom_proj = np.dot(bottom.cart_coords, ab_normal_unit)
+        min_proj_bottom = bottom_proj.min()
+        bottom.translate_sites(
+            list(range(len(bottom))),
+            -ab_normal_unit * min_proj_bottom,
+        )
+        bottom_proj = np.dot(bottom.cart_coords, ab_normal_unit)
+        max_proj_bottom = bottom_proj.max()
+    else:
+        max_proj_bottom = 0.0
+
+    # Align top slab so its minimum projection is at the desired separation.
+    if len(top) > 0:
+        top_proj = np.dot(top.cart_coords, ab_normal_unit)
+        min_proj_top = top_proj.min()
+        top.translate_sites(
+            list(range(len(top))),
+            -ab_normal_unit * min_proj_top,
+        )
+        top.translate_sites(
+            list(range(len(top))),
+            ab_normal_unit * (max_proj_bottom + separation),
+        )
+        top_proj = np.dot(top.cart_coords, ab_normal_unit)
+        desired_min = max_proj_bottom + separation + 0.1
+        min_proj_top_post = top_proj.min()
+        if min_proj_top_post < desired_min - 1e-4:
+            adjust = desired_min - min_proj_top_post
+            top.translate_sites(list(range(len(top))), ab_normal_unit * adjust)
+            top_proj = np.dot(top.cart_coords, ab_normal_unit)
+        max_proj_top = top_proj.max()
+    else:
+        max_proj_top = max_proj_bottom + separation
+
+    # Determine combined cell length along the interface normal and construct the new lattice.
+    total_z = max_proj_top + vacuum
     
     # Verify top's in-plane vectors match (should be true after straining)
     top_lat = top.lattice.matrix
@@ -189,14 +342,6 @@ def align_and_stack_ordered(slab_bottom, slab_top, separation=3.2, vacuum=20.0):
         top = Structure(top_lattice_new, top.species, 
                        [top_lattice_new.get_fractional_coords(coord) for coord in top_cart_coords],
                        coords_are_cartesian=False)
-    
-    # Calculate surface normal from in-plane vectors
-    ab_normal = np.cross(a_vec, b_vec)
-    ab_normal_norm = np.linalg.norm(ab_normal)
-    if ab_normal_norm < 1e-10:
-        raise ValueError("In-plane vectors are parallel or degenerate")
-    ab_normal_unit = ab_normal / ab_normal_norm
-    
     # Create c vector perpendicular to ab plane with correct magnitude
     c_vec = ab_normal_unit * total_z
     
@@ -241,16 +386,20 @@ def align_and_stack_ordered(slab_bottom, slab_top, separation=3.2, vacuum=20.0):
     combined.sort(key=lambda site: site.frac_coords[2])
     
     # Verify separation: ensure bottom and top are properly separated
-    bottom_z_coords = bottom_separated.cart_coords[:, 2]
-    top_z_coords = top_separated.cart_coords[:, 2]
-    if len(bottom_z_coords) > 0 and len(top_z_coords) > 0:
-        bottom_z_max = bottom_z_coords.max()
-        top_z_min = top_z_coords.min()
-        gap_size = top_z_min - bottom_z_max
+    if len(bottom_separated) > 0 and len(top_separated) > 0:
+        c_unit = ab_normal_unit
+        bottom_proj = np.dot(bottom_separated.cart_coords, c_unit)
+        top_proj = np.dot(top_separated.cart_coords, c_unit)
+        bottom_proj_max = bottom_proj.max()
+        top_proj_min = top_proj.min()
+        gap_size = top_proj_min - bottom_proj_max
         if gap_size < 0:
-            print(f"Warning: Overlap detected! bottom_z_max={bottom_z_max:.2f} Å, top_z_min={top_z_min:.2f} Å")
+            print(
+                f"Warning: Overlap detected along interface normal! "
+                f"bottom_max={bottom_proj_max:.2f} Å, top_min={top_proj_min:.2f} Å"
+            )
         elif gap_size < 0.5:
-            print(f"Warning: Very small gap: {gap_size:.2f} Å")
+            print(f"Warning: Very small gap ({gap_size:.2f} Å) along interface normal.")
     
     return bottom_separated, top_separated, combined
 
@@ -285,256 +434,149 @@ def estimate_atoms_for_match(structA, structB, miller_a, miller_b, supercell_a, 
         # If estimation fails, return a large number
         return 10000
 
-def build_interface_from_builder(structA, structB, miller_a, miller_b, slab_thickness_a, slab_thickness_b, 
-                                  vacuum, sep, max_area, zslgen, max_atoms=400):
+def build_interface_from_builder(
+    structA,
+    structB,
+    miller_a,
+    miller_b,
+    slab_thickness_a,
+    slab_thickness_b,
+    vacuum,
+    sep,
+    zsl_param_candidates,
+    target_match=None,
+    max_atoms: int = 400,
+):
     """
-    Build ordered interface using CoherentInterfaceBuilder's get_interfaces method.
-    This ensures proper alignment and high symmetry.
-    Automatically adjusts thickness if atom count exceeds max_atoms.
+    Attempt to construct an ordered interface using CoherentInterfaceBuilder. The search
+    iterates over candidate ZSL parameter sets and slab thickness scaling factors until
+    an interface within the atom limit is located. If none satisfy the limit, the
+    smallest interface found is returned.
     """
     from pymatgen.analysis.interfaces.zsl import ZSLGenerator
-    
-    builder = CoherentInterfaceBuilder(
-        substrate_structure=structB,
-        film_structure=structA,
-        film_miller=miller_a,
-        substrate_miller=miller_b,
-        zslgen=zslgen
-    )
-    
-    if not builder.zsl_matches or len(builder.zsl_matches) == 0:
-        return None, None, None
-    
-    # Get terminations
-    terminations = builder.terminations
-    if len(terminations) == 0:
-        return None, None, None
-    
-    # Try different terminations and thicknesses to find one within atom limit
-    best_interface = None
-    best_atoms = float('inf')
-    best_thickness_a = slab_thickness_a
-    best_thickness_b = slab_thickness_b
-    best_termination = None
-    
-    # Try reducing thickness if needed - start with smaller thickness
-    # Calculate initial atom count to determine starting factor
-    initial_interface = None
-    try:
-        initial_interfaces = list(builder.get_interfaces(
-            termination=terminations[0],
-            gap=sep,
-            vacuum_over_film=vacuum,
-            film_thickness=slab_thickness_a,
-            substrate_thickness=slab_thickness_b,
-            in_layers=False
-        ))
-        if len(initial_interfaces) > 0:
-            initial_interface = initial_interfaces[0]
-            initial_atoms = len(initial_interface)
-            if initial_atoms > max_atoms:
-                # Calculate aggressive reduction factor
-                thickness_factor = (max_atoms / initial_atoms) * 0.8  # 80% to be safe
-            else:
-                thickness_factor = 1.0
-        else:
-            thickness_factor = 0.5  # Start with 50% if we can't estimate
-    except:
-        thickness_factor = 0.5
-    
-    max_attempts = 8
-    min_thickness_a = 3.0  # Minimum thickness in Angstroms
-    min_thickness_b = 3.0
-    
-    for attempt in range(max_attempts):
-        current_thickness_a = max(slab_thickness_a * thickness_factor, min_thickness_a)
-        current_thickness_b = max(slab_thickness_b * thickness_factor, min_thickness_b)
-        
-        for termination in terminations:
+
+    if not zsl_param_candidates:
+        zsl_param_candidates = [
+            {
+                "max_area": 800.0,
+                "max_length_tol": 0.08,
+                "max_angle_tol": 0.03,
+                "bidirectional": True,
+            }
+        ]
+
+    thickness_factors = [1.0, 0.85, 0.7, 0.55, 0.45, 0.35, 0.3]
+    min_thickness = 3.0
+
+    target_key = None
+    if target_match:
+        target_key = _matrix_key(
+            np.array(target_match["film_transformation"]),
+            np.array(target_match["substrate_transformation"]),
+        )
+
+    best_candidate = None
+    best_over_limit = None
+
+    for factor in thickness_factors:
+        current_thickness_a = max(slab_thickness_a * factor, min_thickness)
+        current_thickness_b = max(slab_thickness_b * factor, min_thickness)
+
+        for params in zsl_param_candidates:
             try:
-                interfaces = list(builder.get_interfaces(
-                    termination=termination,
-                    gap=sep,
-                    vacuum_over_film=vacuum,
-                    film_thickness=current_thickness_a,
-                    substrate_thickness=current_thickness_b,
-                    in_layers=False  # Use Angstroms
-                ))
-                
-                if len(interfaces) > 0:
-                    interface = interfaces[0]
-                    n_atoms = len(interface)
-                    
-                    if n_atoms <= max_atoms and n_atoms < best_atoms:
-                        best_interface = interface
-                        best_atoms = n_atoms
-                        best_thickness_a = current_thickness_a
-                        best_thickness_b = current_thickness_b
-                        best_termination = termination
-            except:
+                zslgen = ZSLGenerator(
+                    max_area=params.get("max_area", 800.0),
+                    max_length_tol=params.get("max_length_tol", 0.08),
+                    max_angle_tol=params.get("max_angle_tol", 0.03),
+                    bidirectional=params.get("bidirectional", True),
+                )
+            except TypeError:
+                zslgen = ZSLGenerator(max_area=params.get("max_area", 800.0))
+
+            builder = CoherentInterfaceBuilder(
+                substrate_structure=structB,
+                film_structure=structA,
+                film_miller=miller_a,
+                substrate_miller=miller_b,
+                zslgen=zslgen,
+            )
+
+            if not builder.zsl_matches:
                 continue
-        
-        if best_interface is not None:
-            break
-        
-        # Reduce thickness more aggressively for next attempt
-        thickness_factor *= 0.6
-    
-    if best_interface is None:
-        print(f"Warning: Could not find interface with <={max_atoms} atoms. Trying smallest available...")
-        # Try with very small thickness to find minimum possible
-        for termination in terminations:
-            for thin_factor in [0.3, 0.2, 0.15, 0.1]:
+
+            terminations = builder.terminations
+            if not terminations:
+                continue
+
+            matches = builder.zsl_matches
+            for termination in terminations:
                 try:
-                    thin_a = max(slab_thickness_a * thin_factor, min_thickness_a)
-                    thin_b = max(slab_thickness_b * thin_factor, min_thickness_b)
-                    interfaces = list(builder.get_interfaces(
-                        termination=termination,
-                        gap=sep,
-                        vacuum_over_film=vacuum,
-                        film_thickness=thin_a,
-                        substrate_thickness=thin_b,
-                        in_layers=False
-                    ))
-                    if len(interfaces) > 0:
-                        interface = interfaces[0]
-                        n_atoms = len(interface)
-                        if n_atoms < best_atoms:
-                            best_interface = interface
-                            best_atoms = n_atoms
-                            best_thickness_a = thin_a
-                            best_thickness_b = thin_b
-                            best_termination = termination
-                            if n_atoms <= max_atoms:
-                                break
-                except:
+                    interfaces = list(
+                        builder.get_interfaces(
+                            termination=termination,
+                            gap=sep,
+                            vacuum_over_film=vacuum,
+                            film_thickness=current_thickness_a,
+                            substrate_thickness=current_thickness_b,
+                            in_layers=False,
+                        )
+                    )
+                except Exception:
                     continue
-            if best_interface is not None and best_atoms <= max_atoms:
-                break
-        
-        if best_interface is None:
-            # Last resort: use first available
-            termination = terminations[0]
-            interfaces = list(builder.get_interfaces(
-                termination=termination,
-                gap=sep,
-                vacuum_over_film=vacuum,
-                film_thickness=slab_thickness_a,
-                substrate_thickness=slab_thickness_b,
-                in_layers=False
-            ))
-            if len(interfaces) > 0:
-                best_interface = interfaces[0]
-                best_atoms = len(best_interface)
-                best_termination = termination
-            else:
-                return None, None, None
-    
-    print(f"Using termination: {best_termination}")
-    print(f"Interface contains {best_atoms} atoms (target: <={max_atoms})")
-    if best_atoms > max_atoms:
-        print(f"Warning: Atom count ({best_atoms}) exceeds limit ({max_atoms})")
-    
-    interface = best_interface
-    
-    # The interface structure from CoherentInterfaceBuilder.get_interfaces is already complete
-    # It contains both slabs properly aligned
-    combined = interface
-    
-    # Extract bottom and top slabs from interface for separate POSCAR files
-    # Use a robust method to find the interface plane based on z-coordinate gaps
-    z_coords = combined.cart_coords[:, 2]
-    z_min, z_max = z_coords.min(), z_coords.max()
-    z_range = z_max - z_min
-    
-    # Method 1: Find the largest gap in z-coordinates (most reliable for interfaces)
-    sorted_z = np.sort(z_coords)
-    z_diffs = np.diff(sorted_z)
-    
-    if len(z_diffs) > 0:
-        max_gap_idx = np.argmax(z_diffs)
-        max_gap_size = z_diffs[max_gap_idx]
-        interface_z = (sorted_z[max_gap_idx] + sorted_z[max_gap_idx + 1]) / 2.0
-        
-        # Only use gap method if gap is significant (at least 0.5 Å or 5% of range)
-        min_gap_threshold = max(0.5, z_range * 0.05)
-        if max_gap_size < min_gap_threshold:
-            # Gap too small, use density-based method
-            n_bins = min(100, max(10, len(z_coords) // 10))
-            if n_bins > 0:
-                hist, bin_edges = np.histogram(z_coords, bins=n_bins)
-                # Find bin with minimum density (likely the gap)
-                min_density_idx = np.argmin(hist)
-                if min_density_idx < len(bin_edges) - 1:
-                    gap_z = (bin_edges[min_density_idx] + bin_edges[min_density_idx + 1]) / 2.0
-                    # Use gap_z if it's reasonable (not too close to edges)
-                    if gap_z > z_min + z_range * 0.1 and gap_z < z_max - z_range * 0.1:
-                        interface_z = gap_z
-                        print(f"Using density-based interface detection: z={interface_z:.2f} Å")
-    else:
-        # Fallback: use median
-        interface_z = np.median(z_coords)
-        print(f"Warning: Using median for interface detection: z={interface_z:.2f} Å")
-    
-    # Separate sites based on interface_z
-    # Use a tolerance to ensure clean separation, but make it adaptive
-    tolerance = max(0.05, min(0.5, z_range * 0.01))  # Between 0.05 and 0.5 Å
-    
-    bottom_sites = []
-    top_sites = []
-    
-    # First pass: separate based on z coordinate
-    for i, site in enumerate(combined):
-        z_coord = site.coords[2]
-        if z_coord < interface_z - tolerance:
-            bottom_sites.append(i)
-        elif z_coord > interface_z + tolerance:
-            top_sites.append(i)
-        else:
-            # In the tolerance region: assign to the closer side
-            if z_coord < interface_z:
-                bottom_sites.append(i)
-            else:
-                top_sites.append(i)
-    
-    # Verify separation: check that we have atoms in both parts
-    if len(bottom_sites) == 0 or len(top_sites) == 0:
-        print("Warning: Initial separation failed, trying alternative method")
-        # Try using the actual gap position more strictly
-        if len(z_diffs) > 0:
-            # Use the exact gap position
-            interface_z = sorted_z[max_gap_idx]
-            bottom_sites = [i for i, z in enumerate(z_coords) if z <= interface_z]
-            top_sites = [i for i, z in enumerate(z_coords) if z > interface_z]
-        else:
-            # Last resort: use median
-            interface_z = np.median(z_coords)
-            bottom_sites = [i for i, site in enumerate(combined) if site.coords[2] < interface_z]
-            top_sites = [i for i, site in enumerate(combined) if site.coords[2] >= interface_z]
-    
-    # Create separate structures using the same lattice as combined
-    # This preserves the structure integrity
-    bottom = Structure(combined.lattice, 
-                      [combined[i].species_string for i in bottom_sites],
-                      [combined[i].frac_coords for i in bottom_sites],
-                      coords_are_cartesian=False)
-    
-    top = Structure(combined.lattice,
-                   [combined[i].species_string for i in top_sites],
-                   [combined[i].frac_coords for i in top_sites],
-                   coords_are_cartesian=False)
-    
-    # Verify separation quality
-    if len(bottom_sites) > 0 and len(top_sites) > 0:
-        bottom_z_max = z_coords[bottom_sites].max()
-        top_z_min = z_coords[top_sites].min()
-        gap_size = top_z_min - bottom_z_max
-        print(f"Separation verification: bottom z_max={bottom_z_max:.2f} Å, top z_min={top_z_min:.2f} Å, gap={gap_size:.2f} Å")
-        if gap_size < 0:
-            print("Warning: Overlap detected between bottom and top structures!")
-        elif gap_size < 0.5:
-            print("Warning: Very small gap between bottom and top structures!")
-    
+
+                for idx, interface in enumerate(interfaces):
+                    if idx >= len(matches):
+                        break
+
+                    match_obj = matches[idx]
+                    match_key = _matrix_key(
+                        np.array(match_obj.film_transformation),
+                        np.array(match_obj.substrate_transformation),
+                    )
+                    if target_key and match_key != target_key:
+                        continue
+
+                    n_atoms = len(interface)
+                    candidate_info = {
+                        "interface": interface,
+                        "termination": termination,
+                        "params": params,
+                        "thickness_a": current_thickness_a,
+                        "thickness_b": current_thickness_b,
+                        "atoms": n_atoms,
+                        "match_key": match_key,
+                    }
+
+                    if n_atoms <= max_atoms:
+                        if best_candidate is None or n_atoms < best_candidate["atoms"]:
+                            best_candidate = candidate_info
+                    else:
+                        if best_over_limit is None or n_atoms < best_over_limit["atoms"]:
+                            best_over_limit = candidate_info
+
+        if best_candidate is not None:
+            break
+
+    chosen = best_candidate or best_over_limit
+    if chosen is None:
+        return None, None, None
+
+    interface: "Interface" = chosen["interface"]
+    print(f"Using termination: {chosen['termination']}")
+    print(f"Interface contains {chosen['atoms']} atoms (target: <= {max_atoms})")
+    if chosen["atoms"] > max_atoms:
+        print(f"Warning: Atom count ({chosen['atoms']}) exceeds limit ({max_atoms})")
+    print(
+        f"ZSL parameters: {chosen['params']} | film thickness={chosen['thickness_a']:.2f} Å, "
+        f"substrate thickness={chosen['thickness_b']:.2f} Å"
+    )
+
+    combined = interface.copy()
+    combined.sort(key=lambda site: site.frac_coords[2])
+
+    bottom = Structure.from_sites(interface.substrate_sites)
+    top = Structure.from_sites(interface.film_sites)
+
     return bottom, top, combined
 
 def auto_run(a_file, b_file, miller_a, miller_b, slab_thickness_a, slab_thickness_b, vacuum, sep, tol, max_area, strain_target, use_builder_interface=False, max_atoms=400):
@@ -548,31 +590,33 @@ def auto_run(a_file, b_file, miller_a, miller_b, slab_thickness_a, slab_thicknes
     print("Primitive cell A lattice:", Aprim.lattice.abc)
     print("Primitive cell B lattice:", Bprim.lattice.abc)
 
-    # Option to use CoherentInterfaceBuilder's get_interfaces for ordered interface
-    if use_builder_interface:
-        print("Building ordered interface using CoherentInterfaceBuilder.get_interfaces...")
-        from pymatgen.analysis.interfaces.zsl import ZSLGenerator
-        try:
-            zslgen = ZSLGenerator(max_area=max_area)
-        except TypeError:
-            zslgen = ZSLGenerator()
-        
-        bottom, top, combined = build_interface_from_builder(
-            Aprim, Bprim, miller_a, miller_b,
-            slab_thickness_a, slab_thickness_b, vacuum, sep, max_area, zslgen, max_atoms
-        )
-        
-        if combined is not None:
-            print("Successfully built ordered interface using CoherentInterfaceBuilder.")
-            write_poscars(bottom, top, combined, prefix="auto_interface")
-            return
-    
     # Search for matches using bulk structures and Miller indices
     print("Searching for low-strain matches (this may take a moment)...")
-    matches = search_matches(Aprim, Bprim, miller_a, miller_b, tol=tol, max_area=max_area)
+    matches = search_matches(
+        Aprim,
+        Bprim,
+        miller_a,
+        miller_b,
+        tol=tol,
+        max_area=max_area,
+        allow_bidirectional=True,
+    )
     
     if len(matches) == 0:
         raise RuntimeError("No matches found within tolerance. Increase tol or max_area.")
+    
+    # Collect unique ZSL generator parameter sets observed in the matches.
+    zsl_param_list: List[Dict[str, float | bool]] = []
+    param_keys_seen: Set[Tuple[Tuple[str, float | bool], ...]] = set()
+    for match in matches:
+        params = match.get("zsl_params")
+        if not params:
+            continue
+        key = tuple(sorted(params.items()))
+        if key in param_keys_seen:
+            continue
+        param_keys_seen.add(key)
+        zsl_param_list.append(params)
     
     # Build slabs after finding matches (needed for final structure construction)
     print("Building slabs (unstrained) for final structure...")
@@ -599,77 +643,70 @@ def auto_run(a_file, b_file, miller_a, miller_b, slab_thickness_a, slab_thicknes
         
         return optimal_a, optimal_b
     
-    # Score matches prioritizing atom count, then strain
-    # For DFT efficiency, atom count is more important than perfect strain matching
+    # Score matches prioritizing atom count, then strain/area metrics
     def match_score(m):
-        sa = np.array(m["strain_A"]) if m["strain_A"] is not None else np.array([0, 0, 0])
-        sb = np.array(m["strain_B"]) if m["strain_B"] is not None else np.array([0, 0, 0])
-        strain_magnitude = np.linalg.norm(sa) + np.linalg.norm(sb)
-        
-        # Estimate atom count with optimal thickness for this match
         opt_thick_a, opt_thick_b = estimate_optimal_thickness(m, max_atoms)
         est_atoms = estimate_atoms_for_match(
-            Aprim, Bprim, miller_a, miller_b,
-            m["supercell_a"], m["supercell_b"],
-            opt_thick_a, opt_thick_b
+            Aprim,
+            Bprim,
+            miller_a,
+            miller_b,
+            m["supercell_a"],
+            m["supercell_b"],
+            opt_thick_a,
+            opt_thick_b,
         )
-        
-        # Calculate supercell volume to estimate atom density
-        det_a = abs(np.linalg.det(m["supercell_a"]))
-        det_b = abs(np.linalg.det(m["supercell_b"]))
-        supercell_factor = max(det_a, det_b)  # Larger supercell = more atoms
-        
-        # Prioritize atom count heavily - if over limit, heavily penalize
+
+        length_metric = float(m.get("length_mismatch", 0.0))
+        angle_metric = float(m.get("angle_mismatch", 0.0))
+        area_metric = float(m.get("area", 0.0))
+        supercell_factor = float(max(m.get("det_a", 0.0), m.get("det_b", 0.0)))
+
         if est_atoms > max_atoms:
-            # Very heavy penalty for exceeding limit
-            atom_penalty = (est_atoms - max_atoms) * 2.0 + (est_atoms / max_atoms - 1.0) * 10.0
+            atom_penalty = (est_atoms - max_atoms) * 4.0 + (est_atoms / max_atoms - 1.0) * 20.0
         else:
-            # Small bonus for being well under limit
-            atom_penalty = -(max_atoms - est_atoms) / max_atoms * 0.1
-        
-        # Area penalty (smaller area generally means smaller supercell)
-        area_penalty = m["area"] / 500.0
-        
-        # Strain penalty (less important than atom count)
-        strain_penalty = strain_magnitude * 0.1
-        
-        # Primary score: atom count first, then strain
-        primary_score = atom_penalty + strain_penalty + area_penalty
-        
-        return primary_score, est_atoms, strain_magnitude
-    
-    # Score all matches
-    matches_scored = [(m, match_score(m)) for m in matches]
-    
-    # Sort primarily by atom count (within limit), then by total score
-    matches_scored.sort(key=lambda x: (
-        0 if x[1][1] <= max_atoms else 1,  # Within limit first
-        x[1][1],  # Then by atom count
-        x[1][0]   # Then by score
-    ))
-    
-    # Prioritize matches within atom limit
-    valid_matches = [m for m, (score, atoms, strain) in matches_scored if atoms <= max_atoms]
-    
+            atom_penalty = -((max_atoms - est_atoms) / max_atoms) * 5.0
+
+        strain_penalty = length_metric * 200.0 + angle_metric * 2.0
+        area_penalty = (area_metric / max(max_area, 1.0)) * 5.0
+        supercell_penalty = supercell_factor
+
+        total_penalty = atom_penalty + strain_penalty + area_penalty + supercell_penalty
+
+        m["_cached_opt_thickness"] = (opt_thick_a, opt_thick_b)
+        m["_cached_est_atoms"] = est_atoms
+        m["_cached_strain_penalty"] = strain_penalty
+
+        return total_penalty, est_atoms, strain_penalty
+
+    matches_with_scores = [(idx, m, match_score(m)) for idx, m in enumerate(matches)]
+
+    matches_with_scores.sort(
+        key=lambda item: (
+            0 if item[2][1] <= max_atoms else 1,
+            item[2][1],
+            item[1].get("priority", (item[0],)),
+            item[2][0],
+        )
+    )
+
+    valid_matches = [item for item in matches_with_scores if item[2][1] <= max_atoms]
+
     if len(valid_matches) > 0:
-        matches_sorted = valid_matches
+        ordered_items = valid_matches
         print(f"Found {len(valid_matches)} matches within atom limit ({max_atoms})")
-        # Among valid matches, prefer smallest atom count
-        matches_sorted.sort(key=lambda m: match_score(m)[1])
     else:
-        # If no matches within limit, find the one that's closest to limit
-        print(f"Warning: No matches within atom limit ({max_atoms}). Finding closest match...")
-        matches_sorted = [m for m, _ in matches_scored]
-        # Sort by how close to limit (prefer smaller)
-        matches_sorted.sort(key=lambda m: match_score(m)[1])
-    
-    best = matches_sorted[0]
-    (best_score, best_atoms, best_strain) = match_score(best)
+        ordered_items = matches_with_scores
+        print(f"Warning: No matches within atom limit ({max_atoms}). Selecting closest candidate...")
+
+    best_item = ordered_items[0]
+    best = best_item[1]
+    (best_score, best_atoms, best_strain_metric) = best_item[2]
     
     # Calculate optimal thickness for selected match
-    optimal_thick_a, optimal_thick_b = estimate_optimal_thickness(best, max_atoms)
+    optimal_thick_a, optimal_thick_b = best.get("_cached_opt_thickness", estimate_optimal_thickness(best, max_atoms))
     
-    print(f"Selected match with estimated {best_atoms} atoms (strain: {best_strain:.4f})")
+    print(f"Selected match with estimated {best_atoms} atoms (strain metric: {best_strain_metric:.4f})")
     print(f"Optimal thickness for this match: A={optimal_thick_a:.2f} Å, B={optimal_thick_b:.2f} Å")
     
     # Use optimal thickness if significantly different
@@ -679,17 +716,61 @@ def auto_run(a_file, b_file, miller_a, miller_b, slab_thickness_a, slab_thicknes
         print(f"  B: {slab_thickness_b:.2f} -> {optimal_thick_b:.2f} Å")
         slab_thickness_a = optimal_thick_a
         slab_thickness_b = optimal_thick_b
+
+    if use_builder_interface:
+        print("Attempting ordered interface construction via CoherentInterfaceBuilder...")
+        builder_param_candidates = zsl_param_list or [
+            {
+                "max_area": float(max_area),
+                "max_length_tol": float(max(tol, 0.03)),
+                "max_angle_tol": float(min(0.08, max(tol / 2.0, 0.02))),
+                "bidirectional": True,
+            }
+        ]
+
+        bottom, top, combined = build_interface_from_builder(
+            Aprim,
+            Bprim,
+            miller_a,
+            miller_b,
+            slab_thickness_a,
+            slab_thickness_b,
+            vacuum,
+            sep,
+            builder_param_candidates,
+            target_match=best,
+            max_atoms=max_atoms,
+        )
+
+        if combined is not None:
+            print("Successfully built ordered interface using CoherentInterfaceBuilder.")
+            write_poscars(bottom, top, combined, prefix="auto_interface")
+            return
+        else:
+            print("Ordered interface generation failed; falling back to manual stacking workflow.")
     
-    mobj = best["match_obj"]
     print("Best match summary:")
     print(" area:", best["area"])
     print(" supercell A matrix:\n", best["supercell_a"])
     print(" supercell B matrix:\n", best["supercell_b"])
-    print(" strain on A (approx):", best["strain_A"])
-    print(" strain on B (approx):", best["strain_B"])
-    # Use the InterfaceMatch object to build the supercell structures (pymatgen has helper)
-    # NOTE: CoherentInterfaceBuilder provides methods to get transformed slabs via match_obj.construct_interface? 
-    # For portability, we'll manually apply supercell transformations using matrices.
+    if "det_a" in best and "det_b" in best:
+        print(f" determinants det(A)={best['det_a']:.2f}, det(B)={best['det_b']:.2f}")
+    if "length_components" in best:
+        print(
+            " length mismatch (fractional per in-plane vector):",
+            np.array2string(np.array(best["length_components"]), precision=5),
+        )
+    if "angle_mismatch" in best:
+        angles = best.get("angles", (None, None))
+        if angles[0] is not None and angles[1] is not None:
+            print(
+                f" angles (film/substrate): {angles[0]:.3f}° / {angles[1]:.3f}° | mismatch {best['angle_mismatch']:.3f}°"
+            )
+        else:
+            print(f" angle mismatch: {best['angle_mismatch']:.3f}°")
+    if "zsl_params" in best:
+        print(" ZSL parameter set:", best["zsl_params"])
+    # Use the InterfaceMatch data to build the supercell structures manually.
 
     # Apply supercell transform matrices to slabs (they are 3x3 integer matrices)
     supA = np.array(best["supercell_a"])
