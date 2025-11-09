@@ -16,6 +16,7 @@ Requirements: pymatgen, numpy
 
 import argparse
 import math
+from pathlib import Path
 from typing import Dict, Iterable, List, Set, Tuple
 
 import numpy as np
@@ -129,6 +130,16 @@ def _generate_zsl_parameter_grid(
 
     param_grid.sort(key=lambda p: (p["max_area"], p["max_length_tol"], 0 if p["bidirectional"] else 1))
     return param_grid
+
+
+def _safe_structure_label(path_str: str) -> str:
+    """
+    Derive a readable label from an input structure path by stripping directories,
+    removing the file suffix, and replacing spaces with underscores.
+    """
+    path = Path(path_str)
+    label = path.stem  # Removes the final suffix such as .cif, .vasp, etc.
+    return label.replace(" ", "_")
 
 
 def _reorder_structure_for_poscar(struct: Structure) -> Structure:
@@ -420,14 +431,26 @@ def align_and_stack_ordered(slab_bottom, slab_top, separation=3.2, vacuum=20.0):
     
     return bottom_separated, top_separated, combined
 
-def write_poscars(bottom, top, combined, prefix="interface"):
+def write_poscars(bottom, top, combined, output_dir: Path, base_name: str):
+    output_dir.mkdir(parents=True, exist_ok=True)
     bottom_for_io = _reorder_structure_for_poscar(bottom)
     top_for_io = _reorder_structure_for_poscar(top)
     combined_for_io = _reorder_structure_for_poscar(combined)
-    Poscar(bottom_for_io, sort_structure=False).write_file(f"{prefix}_bottom_strained.vasp")
-    Poscar(top_for_io, sort_structure=False).write_file(f"{prefix}_top_strained.vasp")
-    Poscar(combined_for_io, sort_structure=False).write_file(f"{prefix}_combined.vasp")
-    print("Wrote POSCARs:", f"{prefix}_bottom_strained.vasp", f"{prefix}_top_strained.vasp", f"{prefix}_combined.vasp")
+
+    bottom_path = output_dir / f"{base_name}_bottom_strained.vasp"
+    top_path = output_dir / f"{base_name}_top_strained.vasp"
+    combined_path = output_dir / f"{base_name}.vasp"
+
+    Poscar(bottom_for_io, sort_structure=False).write_file(bottom_path)
+    Poscar(top_for_io, sort_structure=False).write_file(top_path)
+    Poscar(combined_for_io, sort_structure=False).write_file(combined_path)
+
+    print(
+        "Wrote POSCARs:",
+        bottom_path,
+        top_path,
+        combined_path,
+    )
 
 def estimate_atoms_for_match(structA, structB, miller_a, miller_b, supercell_a, supercell_b, 
                              slab_thickness_a, slab_thickness_b):
@@ -610,6 +633,11 @@ def auto_run(a_file, b_file, miller_a, miller_b, slab_thickness_a, slab_thicknes
     print("Primitive cell A lattice:", Aprim.lattice.abc)
     print("Primitive cell B lattice:", Bprim.lattice.abc)
 
+    a_label = _safe_structure_label(a_file)
+    b_label = _safe_structure_label(b_file)
+    hetero_base_name = f"{a_label}@{b_label}"
+    hetero_output_dir = Path("structures") / "heterojunctions"
+
     # Search for matches using bulk structures and Miller indices
     print("Searching for low-strain matches (this may take a moment)...")
     matches = search_matches(
@@ -764,7 +792,7 @@ def auto_run(a_file, b_file, miller_a, miller_b, slab_thickness_a, slab_thicknes
 
         if combined is not None:
             print("Successfully built ordered interface using CoherentInterfaceBuilder.")
-            write_poscars(bottom, top, combined, prefix="auto_interface")
+            write_poscars(bottom, top, combined, hetero_output_dir, hetero_base_name)
             return
         else:
             print("Ordered interface generation failed; falling back to manual stacking workflow.")
@@ -938,7 +966,7 @@ def auto_run(a_file, b_file, miller_a, miller_b, slab_thickness_a, slab_thicknes
     print("Top in-plane vectors:", final_top_lat[0], final_top_lat[1])
     print("Combined in-plane vectors:", final_combined_lat[0], final_combined_lat[1])
     
-    write_poscars(bottom, top, combined, prefix="auto_interface")
+    write_poscars(bottom, top, combined, hetero_output_dir, hetero_base_name)
 
     # print final in-plane match results
     final_a = np.linalg.norm(bottom.lattice.matrix[0]), np.linalg.norm(bottom.lattice.matrix[1])
