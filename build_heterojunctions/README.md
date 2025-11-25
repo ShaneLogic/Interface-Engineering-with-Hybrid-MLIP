@@ -272,3 +272,106 @@ python build_heterojunctions/fix_interface_layers.py \
 ```
 
 This generates a structure ready for DFT relaxation calculations with interface layers relaxed and bulk layers fixed.
+
+## Step 3: Stack Pre-relaxed Slabs (Alternative Workflow)
+
+If you have pre-relaxed slab structures and want to stack them with a specific gap, you can use `stack_slabs.py`:
+
+### Basic Usage
+
+```bash
+python build_heterojunctions/stack_slabs.py <slab1_file> <slab2_file> [gap_in_angstrom] [vacuum_in_angstrom] [output_file]
+```
+
+### Parameters
+
+- `slab1_file`: Path to first slab file (bottom slab)
+- `slab2_file`: Path to second slab file (top slab)
+- `gap_in_angstrom`: Gap between two slabs in Angstroms (default: 3.0)
+- `vacuum_in_angstrom`: Total vacuum layer thickness in Angstroms (default: 20.0), split equally between bottom and top
+- `output_file`: Output filename (optional), if not specified will be auto-generated and saved to `relax_slab/` folder
+
+### Examples
+
+**Example 1**: Stack two pre-relaxed slabs with 3 Å gap and 20 Å vacuum
+
+```bash
+python build_heterojunctions/stack_slabs.py \
+    relax_slab/fapbi3_slab_relax.vasp \
+    relax_slab/tio2_fa_slab_relax.vasp \
+    3.0 \
+    20.0
+```
+
+This will create `relax_slab/fapbi3@tio2_fa_stacked.vasp` with structure:
+- Bottom vacuum (10 Å, half of total 20 Å)
+- Slab 1 (fapbi3)
+- Gap (3 Å)
+- Slab 2 (tio2_fa)
+- Top vacuum (10 Å, half of total 20 Å)
+
+**Example 2**: Stack slabs with custom gap and vacuum
+
+```bash
+python build_heterojunctions/stack_slabs.py \
+    relax_slab/fapbi3_slab_relax.vasp \
+    relax_slab/tio2_fa_slab_relax.vasp \
+    5.0 \
+    15.0
+```
+
+**Example 3**: Stack with different spacing and custom output name
+
+```bash
+python build_heterojunctions/stack_slabs.py \
+    relax_slab/mapbi3_slab_relax.vasp \
+    relax_slab/tio2_ma_slab_relax.vasp \
+    3.2 \
+    20.0 \
+    custom_name.vasp
+```
+
+This will create `relax_slab/custom_name.vasp` (still saved in relax_slab folder)
+
+### How It Works
+
+1. Reads two VASP-format slab files
+2. Calculates the thickness of each slab in the z-direction
+3. Creates a structure with the following layout:
+   - Bottom vacuum layer
+   - Slab 1 (bottom slab)
+   - Gap between slabs
+   - Slab 2 (top slab)
+   - Top vacuum layer
+4. Adjusts z-coordinates of both slabs to fit in the new structure
+5. Merges atomic coordinates and element information from both slabs
+6. Updates the z-component of lattice vectors to accommodate both slabs, gap, and vacuum layers
+7. Outputs the combined VASP file
+
+### Output Information
+
+The script displays:
+- z-coordinate range and thickness for each slab
+- Total number of atoms
+- New lattice z-direction length
+- Gap between the two slabs
+
+### Notes
+
+- Both slabs should have the same (or compatible) xy-plane lattice vectors
+- Output file uses Direct coordinates (fractional coordinates)
+- The script automatically merges elements of the same type
+- Output file includes velocity information (initialized to zero)
+- **Output location**: By default, stacked structures are saved to the `relax_slab/` folder
+- **File naming**: Output files are named as `{slab1}@{slab2}_stacked.vasp` (e.g., `fapbi3@tio2_fa_stacked.vasp`)
+- **Duplicate handling**: If a file with the same name already exists, a number suffix will be added (e.g., `fapbi3@tio2_fa_stacked_1.vasp`)
+- **Vacuum layers**: The structure includes vacuum layers at both bottom and top. The specified vacuum thickness is the total (default: 20 Å), which is split equally between bottom and top (10 Å each) to ensure proper isolation for DFT calculations
+- **Structure layout**: The final structure follows: [bottom vacuum] → [slab1] → [gap] → [slab2] → [top vacuum]
+
+### Use Cases
+
+This tool is useful when:
+- You have pre-relaxed slab structures from separate calculations
+- You want to create heterojunctions by stacking relaxed slabs
+- You need precise control over the gap between slabs
+- You want to combine slabs without going through the full interface builder workflow
